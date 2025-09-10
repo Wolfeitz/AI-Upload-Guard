@@ -9,6 +9,20 @@
 
 ---
 
+> ⚠️ Scope & Limitations
+**ai_upload_guard.py** is a **local, heuristic prescan** to help you spot likely sensitive information **before** you paste or upload to AI tools or cloud services.  
+It **does not** guarantee detection and **is not** a Data Loss Prevention (DLP) system, compliance control, or legal review.
+
+- Local only: the tool does not transmit file contents; analysis runs on your machine.
+- Heuristic: patterns, rules, and lightweight ML → **false negatives and false positives are expected**.
+- Human review required: flagged results require your judgment, redaction, and/or approvals.
+- No compliance claim: using this tool does **not** by itself satisfy HIPAA/PCI/GLBA/FERPA/GDPR/… obligations.
+- No secrets in logs: configure/redact logs; never store raw sensitive data in outputs.
+
+**You are responsible** for what you upload. Treat this as an **assistive precheck**, not a safeguard.
+
+---
+
 ## What it scans for
 
 * **PII:** emails, phones (strict; GUID/ID/IP-safe), SSN-like, address-like
