@@ -1,46 +1,40 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: 0BSD
 """
-AI Upload Guard — Heuristic checker for document upload safety pre-screening.
+AI Upload Guard — heuristic pre-scan for upload safety.
 
-Purpose:
-  Local pre-check to flag content that may be ALLOWED / RESTRICTED / PROHIBITED for AI-tool upload
-  based on common risk indicators (PII, regulated data, secrets, source code, network info, client/internal markers).
+Advisory only. Not DLP, not a security control, not legal/compliance review.
+You remain responsible for what you upload.
 
-Supported inputs:
-  .txt, .md, .csv, .json, .yaml/.yml, .log, .pdf, .docx, .xlsx/.xls
-
-Key detectors:
-  - PII: email; phone (GUID/ID/IP-safe); SSN-like; address-like
-  - Financial/regulated: STRICT credit cards (IIN + Luhn + realistic grouping), STRICT IBAN (country + length + MOD-97),
-    bank details (STRICT, contextual: routing ABA, sort code, acct # with digits, SWIFT/BIC codes only)
-  - Health (PHI context): diagnosis, medical record, etc. (keyword-based)
-  - Secrets: keys/tokens/connection strings/private keys/high-entropy tokens/JWTs/auth headers/cookies
-  - Source code: common language & SQL signals
-  - Network: IPv4/IPv6, CIDR, host:port, MAC addresses, internal URLs/hostnames, cloud resource IDs
-  - Schema clues: sensitive field/column names
-  - Unknowns: IP-like partial/mixed tokens (e.g., "420-172.31.120.x") for human review
-
-New in this version:
-  • Financial toggles: --no-financial, --no-cc, --no-iban, --no-bank-hints
-  • Ignore patterns: --ignore "regex" (repeatable) and --ignore-file <path>
-  • Deduplicated output with counts + category summary; cap unique lines with --max-unique
-  • Much stricter bank hints (no 'ACCT-ACPAY2', no 'SWIFT - DEV', no random 'FL...' hostnames)
-
-Examples:
-  python ai_upload_guard.py file.xlsx --context client --assume-approved-tool --no-financial
-  python ai_upload_guard.py file.xlsx --no-bank-hints --ignore "SWIFT\s*-\s*DEV" --ignore "^Financial: bank details"
-  python ai_upload_guard.py file.xlsx --max-unique 50 --ip-as-prohibited --unknown-as-prohibited
+Key features:
+- Local-only scanning (no network calls).
+- Heuristic detectors for PII, financial markers, PHI context, secrets, code, network/infra, client/internal.
+- Dispositions: ALLOWED_* | RESTRICTED | PROHIBITED (exit codes 0/2/3).
+- Default-masked findings to avoid echoing sensitive content into logs.
+- JSON output option for CI.
+- Rulepack hash + version stamp for auditability.
+- Risk acknowledgment (interactive or --acknowledge-risks).
 """
 
 import argparse
+import hashlib
 import ipaddress
+import json
 import math
+import os
 import re
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
-# Optional deps
+APP_NAME = "AI Upload Guard"
+APP_VERSION = "0.4.0"
+
+# Paths / files
+ACK_FILE = Path.home() / ".ai_upload_guard_ack"
+
+# ---------- Optional deps ----------
 try:
     from pdfminer.high_level import extract_text as pdf_extract_text
 except Exception:
@@ -55,51 +49,6 @@ try:
     import pandas as pd
 except Exception:
     pd = None
-
-
-# ---------- Text Extraction ----------
-def read_text(path: Path) -> str:
-    suffix = path.suffix.lower()
-
-    if suffix in [".txt", ".md", ".csv", ".log", ".json", ".yaml", ".yml"]:
-        return path.read_text(errors="ignore")
-
-    if suffix == ".pdf":
-        if not pdf_extract_text:
-            raise RuntimeError("pdfminer.six not available. Install with: pip install pdfminer.six")
-        return pdf_extract_text(str(path))
-
-    if suffix == ".docx":
-        if not docx:
-            raise RuntimeError("python-docx not available. Install with: pip install python-docx")
-        d = docx.Document(str(path))
-        return "\n".join(p.text for p in d.paragraphs)
-
-    if suffix in [".xlsx", ".xls"]:
-        if not pd:
-            raise RuntimeError("pandas not available. Install with: pip install pandas openpyxl")
-        try:
-            xls = pd.ExcelFile(str(path))
-        except Exception as e:
-            raise RuntimeError(f"Failed to open Excel file: {e}")
-
-        chunks = []
-        for sheet in xls.sheet_names:
-            try:
-                df = xls.parse(sheet, dtype=str).fillna("").astype(str)
-            except Exception as e:
-                chunks.append(f"[[Error reading sheet {sheet}: {e}]]")
-                continue
-            for r_idx, row in enumerate(df.values.tolist(), start=1):
-                for c_idx, val in enumerate(row, start=1):
-                    if val.strip():
-                        chunks.append(f"{sheet}!R{r_idx}C{c_idx}: {val}")
-        return "\n".join(chunks)
-
-    raise RuntimeError(
-        f"Unsupported file type: {suffix}. "
-        f"Use .txt/.md/.csv/.json/.yaml/.yml/.log/.pdf/.docx/.xlsx/.xls"
-    )
 
 
 # ---------- Utilities ----------
@@ -120,10 +69,9 @@ def luhn_check(s: str) -> bool:
 
 
 def shannon_entropy(s: str) -> float:
-    import collections
     if not s:
         return 0.0
-    freq = collections.Counter(s)
+    freq = Counter(s)
     n = len(s)
     return -sum((c / n) * math.log2(c / n) for c in freq.values())
 
@@ -179,12 +127,63 @@ def _in_negative_id_context(text: str, start: int, end: int) -> bool:
     return bool(bad_ctx.search(window))
 
 
+# ---------- Text Extraction ----------
+def read_text(path: Path, max_bytes: int = 0, xl_max_cells: int = 2_000_000) -> str:
+    suffix = path.suffix.lower()
+
+    if suffix in [".txt", ".md", ".csv", ".log", ".json", ".yaml", ".yml"]:
+        data = path.read_bytes()
+        if max_bytes and len(data) > max_bytes:
+            return data[:max_bytes].decode(errors="ignore")
+        return data.decode(errors="ignore")
+
+    if suffix == ".pdf":
+        if not pdf_extract_text:
+            raise RuntimeError("pdfminer.six not available. Install with: pip install pdfminer.six")
+        return pdf_extract_text(str(path))
+
+    if suffix == ".docx":
+        if not docx:
+            raise RuntimeError("python-docx not available. Install with: pip install python-docx")
+        d = docx.Document(str(path))
+        return "\n".join(p.text for p in d.paragraphs)
+
+    if suffix in [".xlsx", ".xls"]:
+        if not pd:
+            raise RuntimeError("pandas not available. Install with: pip install pandas openpyxl")
+        try:
+            xls = pd.ExcelFile(str(path))
+        except Exception as e:
+            raise RuntimeError(f"Failed to open Excel file: {e}")
+
+        chunks = []
+        for sheet in xls.sheet_names:
+            try:
+                df = xls.parse(sheet, dtype=str).fillna("").astype(str)
+            except Exception as e:
+                chunks.append(f"[[Error reading sheet {sheet}: {e}]]")
+                continue
+            if df.size > xl_max_cells:
+                chunks.append(f"[[Skipped {sheet}: too large ({df.size} cells)]]")
+                continue
+            for r_idx, row in enumerate(df.values.tolist(), start=1):
+                for c_idx, val in enumerate(row, start=1):
+                    if val.strip():
+                        chunks.append(f"{sheet}!R{r_idx}C{c_idx}: {val}")
+        return "\n".join(chunks)
+
+    raise RuntimeError(
+        f"Unsupported file type: {suffix}. "
+        f"Use .txt/.md/.csv/.json/.yaml/.yml/.log/.pdf/.docx/.xlsx/.xls"
+    )
+
+
 # ---------- PII ----------
 def detect_pii(text: str, require_phone_context: bool = False):
     """
     Phone detection is strict:
       - E.164: +<7-14 digits>
-      - NANP: (xxx) xxx-xxxx  OR  xxx-xxx-xxxx  OR  xxx xxx xxxx  OR  xxx.xxx.xxxx
+      - NANP: (xxx) xxx-xxxx / xxx-xxx-xxxx / xxx xxx xxxx / xxx.xxx.xxxx
       - Intl grouped: country & groups separated by spaces or hyphens ONLY (no dots)
       - Excludes GUID/UUID and any IP spans; rejects mixed hyphen+dot tokens
     """
@@ -230,7 +229,7 @@ def detect_pii(text: str, require_phone_context: bool = False):
         if not (7 <= len(digits) <= 15):
             continue
 
-        if _in_negative_id_context(text, s, e):
+        if require_phone_context and _in_negative_id_context(text, s, e):
             window = text[max(0, s - 40): min(len(text), e + 40)]
             if not phone_ctx.search(window):
                 continue
@@ -255,6 +254,13 @@ def detect_pii(text: str, require_phone_context: bool = False):
 
 
 # ---------- Financial / Regulated ----------
+_IBAN_COUNTRIES = {
+    "AL","AD","AT","AZ","BH","BE","BA","BG","CR","HR","CY","CZ","DK","DO","EE","FO","FI",
+    "FR","GE","DE","GI","GR","GL","GT","HU","IS","IE","IL","IQ","IT","JO","KZ","XK","KW",
+    "LV","LB","LI","LT","LU","MT","MR","MU","MD","MC","ME","NL","NO","PK","PS","PL","PT",
+    "QA","RO","SM","SA","RS","SK","SI","ES","SE","CH","TN","TR","UA","AE","GB","VG"
+}
+
 def _cc_iin_valid(digits: str) -> bool:
     l = len(digits)
     try:
@@ -335,13 +341,6 @@ def detect_credit_cards_strict(text: str):
     return findings
 
 
-_IBAN_COUNTRIES = {
-    "AL","AD","AT","AZ","BH","BE","BA","BG","CR","HR","CY","CZ","DK","DO","EE","FO","FI",
-    "FR","GE","DE","GI","GR","GL","GT","HU","IS","IE","IL","IQ","IT","JO","KZ","XK","KW",
-    "LV","LB","LI","LT","LU","MT","MR","MU","MD","MC","ME","NL","NO","PK","PS","PL","PT",
-    "QA","RO","SM","SA","RS","SK","SI","ES","SE","CH","TN","TR","UA","AE","GB","VG"
-}
-
 def _iban_mod97(iban: str) -> bool:
     rearranged = iban[4:] + iban[:4]
     digits = ""
@@ -358,6 +357,7 @@ def _iban_mod97(iban: str) -> bool:
     for c in digits:
         rem = (rem * 10 + int(c)) % 97
     return rem == 1
+
 
 def detect_iban_strict(text: str):
     findings = []
@@ -381,7 +381,7 @@ def detect_bank_details_strict(text: str):
       - Routing/ABA: 9 digits with 'routing' or 'aba' nearby
       - Sort Code: 6 digits or 2-2-2 format with 'sort code' nearby
       - Account/Acct: requires 8+ digits (no letters) near 'account'/'acct'
-      - SWIFT/BIC: 8 or 11 character code (letters/digits), not VM names like 'SWIFT - DEV' or 'SWIFT-DB01B'
+      - SWIFT/BIC: 8 or 11 character code, not VM labels like 'SWIFT - DEV'
     """
     findings = []
 
@@ -393,15 +393,14 @@ def detect_bank_details_strict(text: str):
     for m in re.finditer(r"(?i)\bsort\s*code\b[:\s#-]*((?:\d{2}[-\s]\d{2}[-\s]\d{2})|\d{6})", text):
         findings.append(("Financial: bank details (sort code)", m.group(0)))
 
-    # Account number: require 8+ digits; allow spaces/hyphens but no letters in number token
+    # Account number: require 8+ digits; allow spaces/hyphens but no letters
     acct_pat = re.compile(r"(?i)\b(account(?:\s*number)?|acct)\b[:\s#-]*([0-9][0-9\-\s]{7,})")
     for m in acct_pat.finditer(text):
         num = re.sub(r"[\s\-]", "", m.group(2))
         if num.isdigit() and len(num) >= 8:
             findings.append(("Financial: bank details (account)", m.group(0)))
 
-    # SWIFT/BIC code (8 or 11)
-    # Real SWIFT/BIC: 4 letters bank + 2 letters country + 2 alnum location + optional 3 alnum branch
+    # SWIFT/BIC
     for m in re.finditer(r"(?i)\b(?:SWIFT|BIC)\b[:\s#-]*([A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?)\b", text):
         findings.append(("Financial: bank details (SWIFT/BIC)", m.group(0)))
 
@@ -469,11 +468,11 @@ def detect_secrets(text: str):
 def detect_source_code(text: str):
     findings = []
     code_signals = [
-        r"\bclass\s+\w+\s*[:{]", r"\bdef\s+\w+\s*\(", r"\bimport\s+\w+",
-        r"#include\s*<\w+\.h>", r"using\s+namespace\s+\w+",
-        r"\bpublic\s+static\s+void\s+main\b", r"\bfunction\s+\w+\s*\(",
-        r"\bconsole\.log\(", r"\bSELECT\s+.+\s+FROM\b",
-        r"\bINSERT\s+INTO\b", r"\bCREATE\s+TABLE\b",
+        r"\bclass\s+\w+\s*[:{]", r"\bdef\s+\w+\s*\(",
+        r"\bimport\s+\w+", r"#include\s*<\w+\.h>",
+        r"using\s+namespace\s+\w+", r"\bpublic\s+static\s+void\s+main\b",
+        r"\bfunction\s+\w+\s*\(", r"\bconsole\.log\(",
+        r"\bSELECT\s+.+\s+FROM\b", r"\bINSERT\s+INTO\b", r"\bCREATE\s+TABLE\b",
     ]
     for pat in code_signals:
         for m in re.finditer(pat, text, flags=re.IGNORECASE):
@@ -676,7 +675,6 @@ def policy_disposition(findings, strict: bool, assume_approved_tool: bool,
     return "ALLOWED_WITH_CONDITIONS" if assume_approved_tool else "ALLOWED_IF_IN_APPROVED_TOOL"
 
 
-# ---------- Output helpers ----------
 def severity_rank(label: str) -> int:
     if label.startswith(("Secret:", "Regulated:", "PII:", "Source code")):
         return 1
@@ -684,10 +682,12 @@ def severity_rank(label: str) -> int:
         return 2
     return 3
 
+
 def category_name(label: str) -> str:
     if label.startswith("Source code"):
         return "Source code"
     return label.split(":")[0]
+
 
 def print_summary(findings):
     cat_counts = Counter(category_name(lbl) for lbl, _ in findings)
@@ -695,14 +695,100 @@ def print_summary(findings):
         print("Summary: no findings.")
         return
     print("Summary (unique lines, post-dedupe):")
-    for cat, cnt in sorted(cat_counts.items(), key=lambda kv: ({"Secret":0,"Regulated":1,"PII":2,"Source code":3,"Network":4,"Client identifier":5,"Classification marker":6,"Unknown":7}.get(kv[0], 99), -kv[1], kv[0])):
+    order = {"Secret":0,"Regulated":1,"PII":2,"Source code":3,"Network":4,"Client identifier":5,"Classification marker":6,"Unknown":7}
+    for cat, cnt in sorted(cat_counts.items(), key=lambda kv: (order.get(kv[0], 99), -kv[1], kv[0])):
         print(f" - {cat}: {cnt}")
+
+
+# ---------- Rulepack hash & risk ack ----------
+def compute_rulepack_hash() -> str:
+    """Hash core pattern sets (stable-ish) so reports can cite rulepack identity."""
+    buckets = []
+
+    # Keep in sync with secrets patterns + IBAN set
+    secret_pats = [
+        r"AKIA[0-9A-Z]{16}", r"ASIA[0-9A-Z]{16}",
+        r"aws_secret_access_key\s*[:=]\s*([A-Za-z0-9/+=]{30,})",
+        r"(?i)api[_\- ]?key\s*[:=]\s*([A-Za-z0-9_\-]{16,})",
+        r"(?i)token\s*[:=]\s*([A-Za-z0-9\-\._]{16,})",
+        r"(?i)\bAuthorization:\s*Bearer\s+[A-Za-z0-9\-._~+/]+=*",
+        r"(?i)\bAuthorization:\s*Basic\s+[A-Za-z0-9+/]{8,}={0,2}",
+        r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}",
+        r"(?i)\bSet-Cookie:\s*[^;=\s]+=[^;\r\n]+",
+        r"(?i)\bServer=[^;]+;[^;]*Database=[^;]+;[^;]*(?:User\s*Id|Uid)=[^;]+;[^;]*(?:Password|Pwd)=[^;]+;",
+        r"(?i)mongodb(?:\+srv)?:\/\/[^@\s:]+:[^@\s]+@",
+        r"(?i)postgres(?:ql)?:\/\/[^@\s:]+:[^@\s]+@",
+        r"(?i)mysql:\/\/[^@\s:]+:[^@\s]+@",
+        r"(?i)amqps?:\/\/[^@\s:]+:[^@\s]+@",
+        r"(?i)\bSharedAccessSignature=sr=[^&\s]+&sig=[^&\s]+&se=\d+",
+        r"(?i)\bAccountKey=([A-Za-z0-9+/=]{20,})",
+        r"ghp_[A-Za-z0-9]{36,}", r"xox[baprs]-[A-Za-z0-9\-]{10,}",
+        r"ssh-rsa\s+[A-Za-z0-9+/]{100,}={0,3}",
+        r"-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----",
+        r'(?i)"private_key"\s*:\s*"-----BEGIN',
+        r"(?i)<password>[^<]{1,256}</password>",
+    ]
+    buckets.append("|".join(secret_pats))
+    buckets.append("|".join(sorted(_IBAN_COUNTRIES)))
+    buckets.append("v:" + APP_VERSION)
+
+    blob = "\n".join(buckets).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def require_risk_acknowledgment(acknowledge_flag: bool):
+    """Require interactive acknowledgment unless --acknowledge-risks or a prior ack file exists."""
+    if acknowledge_flag or ACK_FILE.exists():
+        return
+    banner = f"""
+{APP_NAME} — Risk Acknowledgment
+This tool is a LOCAL heuristic prescan only. It will miss things and may misclassify content.
+It is NOT DLP, NOT a security control, and NOT legal/compliance review.
+You remain responsible for any data you upload.
+
+Type 'I UNDERSTAND' to continue, or re-run with --acknowledge-risks to suppress.
+"""
+    try:
+        resp = input(banner).strip()
+    except EOFError:
+        resp = ""
+    if resp.upper() != "I UNDERSTAND":
+        print("Aborting without acknowledgment.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        ACK_FILE.write_text(f"{datetime.utcnow().isoformat()}Z {APP_VERSION}\n")
+    except Exception:
+        pass  # non-fatal
+
+
+# ---------- Masking ----------
+def label_bucket(label: str) -> str:
+    if label.startswith(("Secret:", "Regulated:", "PII:", "Source code")):
+        return "high"
+    if label.startswith(("Network:", "Client identifier", "Classification marker", "Unknown:")):
+        return "medium"
+    return "low"
+
+
+def mask_sample(label: str, sample: str) -> str:
+    """Hide sensitive contents while keeping enough context to act."""
+    b = label_bucket(label)
+    if b == "high":
+        s = sample.strip()
+        if len(s) <= 12:
+            return "••••"
+        return f"{s[:4]}••••••••{s[-4:]}"
+    if b == "medium":
+        s = re.sub(r'(?<=\.)[A-Za-z0-9-]{2,}(?=\.)', "••", sample)
+        s = re.sub(r'(\d{1,3}\.){2}\d{1,3}', r"\1•••", s)
+        return s
+    return sample
 
 
 # ---------- CLI ----------
 def build_arg_parser():
     ap = argparse.ArgumentParser(
-        description="AI Upload Guard — policy-aligned document checker",
+        description="AI Upload Guard — policy-aligned document checker (advisory only)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     ap.add_argument("file", type=str,
@@ -726,18 +812,31 @@ def build_arg_parser():
                     help="Only flag phone numbers if phone-related words appear nearby.")
     ap.add_argument("--internal-domains", type=str, default="",
                     help="Regex for internal domains/hosts to flag (e.g., '(?:corp|intra)\\.example\\.com').")
-    ap.add_argument("--max-findings", type=int, default=100,
-                    help="(Legacy) cap raw prints; replaced by --max-unique for deduped output.")
-    # NEW: financial toggles
+    ap.add_argument("--max-unique", type=int, default=200,
+                    help="Show at most this many unique lines (post-dedupe).")
+    ap.add_argument("--no-dedupe", action="store_true",
+                    help="Print raw, non-deduped reasons (not recommended).")
+    ap.add_argument("--ignore", action="append", default=[],
+                    help='Regex to ignore (label/sample). Repeatable.')
+    ap.add_argument("--ignore-file", type=str, default="",
+                    help="Path to file with one regex per line to ignore.")
+    # Financial toggles
     ap.add_argument("--no-financial", action="store_true", help="Disable all financial checks.")
     ap.add_argument("--no-cc", action="store_true", help="Disable credit card detection.")
     ap.add_argument("--no-iban", action="store_true", help="Disable IBAN detection.")
-    ap.add_argument("--no-bank-hints", action="store_true", help="Disable bank details (routing/sort/acct/SWIFT) detection.")
-    # NEW: ignore + dedupe
-    ap.add_argument("--ignore", action="append", default=[], help='Regex to ignore (label/sample). Repeatable.')
-    ap.add_argument("--ignore-file", type=str, default="", help="Path to file with one regex per line to ignore.")
-    ap.add_argument("--max-unique", type=int, default=200, help="Show at most this many unique lines (post-dedupe).")
-    ap.add_argument("--no-dedupe", action="store_true", help="Print raw, non-deduped reasons (not recommended).")
+    ap.add_argument("--no-bank-hints", action="store_true", help="Disable bank details detection.")
+    # Risk ack / masking / JSON
+    ap.add_argument("--acknowledge-risks", action="store_true",
+                    help="Skip interactive risk banner (use in CI after first acknowledgment).")
+    ap.add_argument("--unmask-samples", action="store_true",
+                    help="Print raw samples in findings (NOT recommended).")
+    ap.add_argument("--json", action="store_true",
+                    help="Emit machine-readable JSON (summary, findings, disposition).")
+    # Size guards
+    ap.add_argument("--max-bytes", type=int, default=0,
+                    help="If >0, only read the first N bytes of text-like inputs.")
+    ap.add_argument("--xl-max-cells", type=int, default=2_000_000,
+                    help="Max cells to parse per sheet before skipping.")
     return ap
 
 
@@ -746,13 +845,30 @@ def main():
     ap = build_arg_parser()
     args = ap.parse_args()
 
+    # Risk acknowledgment
+    require_risk_acknowledgment(args.acknowledge_risks)
+
+    # Validate file
     p = Path(args.file)
     if not p.exists():
         print(f"File not found: {p}", file=sys.stderr)
         sys.exit(2)
 
+    # Validate internal-domains regex early
+    if args.internal_domains:
+        try:
+            re.compile(args.internal_domains, re.I)
+        except re.error as e:
+            print(f"[ERROR] Invalid --internal-domains regex: {e}", file=sys.stderr)
+            sys.exit(1)
+
     print(f"[INFO] Reading file: {p}")
-    text = read_text(p)
+    try:
+        text = read_text(p, max_bytes=args.max_bytes, xl_max_cells=args.xl_max_cells)
+    except Exception as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        sys.exit(1)
+
     print(f"[INFO] File loaded ({len(text)} characters). Starting checks...")
 
     findings = []
@@ -804,16 +920,6 @@ def main():
         print(f"[INFO] Applying {len(ignore_patterns)} ignore pattern(s).")
         findings = apply_ignores(findings, ignore_patterns)
 
-    print("[INFO] All checks complete. Compiling disposition...")
-    disposition = policy_disposition(
-        findings,
-        strict=args.strict,
-        assume_approved_tool=args.assume_approved_tool,
-        ip_as_prohibited=args.ip_as_prohibited,
-        hostnames_as_prohibited=args.hostnames_as_prohibited,
-        unknown_as_prohibited=args.unknown_as_prohibited
-    )
-
     # Dedupe + counts
     if not findings:
         unique = []
@@ -832,33 +938,82 @@ def main():
         key=lambda ls: (severity_rank(ls[0]), ls[0], -pair_counts[ls])
     )
 
+    # Disposition
+    disposition = policy_disposition(
+        unique_sorted,
+        strict=args.strict,
+        assume_approved_tool=args.assume_approved_tool,
+        ip_as_prohibited=args.ip_as_prohibited,
+        hostnames_as_prohibited=args.hostnames_as_prohibited,
+        unknown_as_prohibited=args.unknown_as_prohibited
+    )
+
+    # Report header
+    rulepack_hash = compute_rulepack_hash()
     print("\n=== AI Upload Guard Report ===")
+    print("Advisory Only — heuristic prescan; not DLP/compliance/legal review.")
+    print(f"Version: {APP_VERSION}  Rulepack: {rulepack_hash}")
     print(f"File: {p}")
     print(f"Declared context: {args.context}")
     print(f"Disposition: {disposition}\n")
 
     # Summary
-    print_summary(unique_sorted)
-    print()
-
-    # Detailed (deduped) reasons
     if unique_sorted:
+        print_summary(unique_sorted)
+        print()
+
+        # Detailed (deduped) reasons
         print(f"Top findings (unique; up to {args.max_unique}):")
         for i, (label, sample) in enumerate(unique_sorted[: args.max_unique], start=1):
             count = pair_counts[(label, sample)]
-            snippet = (sample[:200] + "…") if len(sample) > 200 else sample
+            shown = sample if args.unmask_samples else mask_sample(label, sample)
+            snippet = (shown[:200] + "…") if len(shown) > 200 else shown
             print(f" {i:>3}. {label}: {snippet}   (x{count})")
         if len(unique_sorted) > args.max_unique:
             print(f" ... ({len(unique_sorted) - args.max_unique} more unique lines not shown)")
     else:
-        print("No risk indicators detected by heuristics.")
+        print("Summary: no findings.")
+        print("\nNo risk indicators detected by heuristics.")
 
     print("\nOperational Notes:")
-    print(" - Use --no-financial / --no-cc / --no-iban / --no-bank-hints to turn off or dial down financial checks.")
-    print(' - Use --ignore "<regex>" (repeatable) and/or --ignore-file to suppress noisy patterns (e.g., SWIFT\\s*-\\s*DEV).')
-    print(" - Output is deduplicated with counts; use --no-dedupe to see raw lines (not recommended for large files).")
-    print(" - Use --ip-as-prohibited / --hostnames-as-prohibited / --unknown-as-prohibited to tighten policy.")
     print(" - Heuristic pre-check; human judgment still required.")
+    print(" - Use --no-financial / --no-cc / --no-iban / --no-bank-hints to dial down financial checks.")
+    print(' - Use --ignore "<regex>" (repeatable) and/or --ignore-file to suppress noisy patterns.')
+    print(" - Output is deduplicated with counts; use --no-dedupe to see raw lines (noisy).")
+    print(" - Use --ip-as-prohibited / --hostnames-as-prohibited / --unknown-as-prohibited to tighten policy.")
+    print(" - Use --json for machine-readable output; findings are masked unless --unmask-samples.")
+
+    # Optional JSON output for CI
+    if args.json:
+        summary_counts = Counter(category_name(lbl) for lbl, _ in unique_sorted)
+        json_payload = {
+            "app": APP_NAME,
+            "version": APP_VERSION,
+            "rulepack": rulepack_hash,
+            "file": str(p),
+            "context": args.context,
+            "disposition": disposition,
+            "summary": dict(summary_counts),
+            "findings": [
+                {
+                    "label": lbl,
+                    "sample": (samp if args.unmask_samples else mask_sample(lbl, samp)),
+                    "count": pair_counts[(lbl, samp)]
+                }
+                for (lbl, samp) in unique_sorted[: args.max_unique]
+            ],
+        }
+        # Emit on a single line for easy parsing
+        print(json.dumps(json_payload, ensure_ascii=False))
+
+    # Exit code mapping
+    exit_code = 0
+    if disposition == "RESTRICTED":
+        exit_code = 2
+    elif disposition == "PROHIBITED":
+        exit_code = 3
+    sys.exit(exit_code)
+
 
 if __name__ == "__main__":
     main()
