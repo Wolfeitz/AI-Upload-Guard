@@ -1,5 +1,8 @@
 # AI Upload Guard — README (Windows, Linux, macOS)
 
+> 🚨 **Advisory Only — Not DLP / Not a Safeguard**
+> This tool is a **local heuristic pre-scan** to help you spot likely sensitive information **before** you paste or upload to AI tools or cloud services. It **will** miss things (false negatives) and **will** flag benign content (false positives). **You remain responsible** for what you upload. See **Scope & Limitations** below.
+
 ## Overview
 
 `ai_upload_guard.py` is a **local pre-check** that scans documents/spreadsheets/logs before you paste or upload them into AI tools or cloud services. It flags likely **PII, secrets, code, network details, client/internal markers, and IP-like oddities**, then assigns a disposition so you can redact, seek approvals, or proceed.
@@ -9,17 +12,18 @@
 
 ---
 
-> ⚠️ Scope & Limitations
-**ai_upload_guard.py** is a **local, heuristic prescan** to help you spot likely sensitive information **before** you paste or upload to AI tools or cloud services.  
-It **does not** guarantee detection and **is not** a Data Loss Prevention (DLP) system, compliance control, or legal review.
+## ⚠️ Scope & Limitations
 
-- Local only: the tool does not transmit file contents; analysis runs on your machine.
-- Heuristic: patterns, rules, and lightweight ML → **false negatives and false positives are expected**.
-- Human review required: flagged results require your judgment, redaction, and/or approvals.
-- No compliance claim: using this tool does **not** by itself satisfy HIPAA/PCI/GLBA/FERPA/GDPR/… obligations.
-- No secrets in logs: configure/redact logs; never store raw sensitive data in outputs.
+**ai\_upload\_guard.py** is a **local, heuristic prescan**. It **does not** guarantee detection and **is not** a Data Loss Prevention (DLP) system, compliance control, or legal review.
 
-**You are responsible** for what you upload. Treat this as an **assistive precheck**, not a safeguard.
+* Local only: analysis runs on your machine; file contents are not transmitted.
+* Heuristic: patterns, rules, and lightweight ML → **false negatives and false positives are expected**.
+* Human review required: flagged results require your judgment, redaction, and/or approvals.
+* No compliance claim: using this tool does **not** by itself satisfy HIPAA/PCI/GLBA/FERPA/GDPR/… obligations.
+* No secrets in logs: configure/redact logs; never store raw sensitive data in outputs.
+* Not for classified/controlled info (e.g., CUI/ITAR): this tool does **not** meet those requirements.
+
+**Treat this as an assistive precheck, not a safeguard or enforcement control.**
 
 ---
 
@@ -47,69 +51,113 @@ It **does not** guarantee detection and **is not** a Data Loss Prevention (DLP) 
 * **ALLOWED\_IF\_IN\_APPROVED\_TOOL** — no risky findings; still use approved tools.
 * **ALLOWED\_WITH\_CONDITIONS** — same as above if you pass `--assume-approved-tool`.
 
+> **Tip:** Use `--strict` to treat **RESTRICTED** as **PROHIBITED** for fail-closed behavior.
+
+---
+
+## Data handling & privacy
+
+* **Processing:** local only. The script performs no network calls during scanning.
+* **Telemetry:** none by default. Auto-updates/telemetry are **not** performed.
+* **Logging:** defaults to minimal metadata (filenames, rule IDs, counts). Raw matches are masked (e.g., `••••`).
+* **Cache/Temp:** ensure your OS temp directory isn’t synced to cloud backup if you process sensitive files.
+* **Rulepacks:** keep a local, versioned rulepack with a displayed SHA-256 so results are auditable.
+
+---
+
+## Exit codes & automation (CI/hooks)
+
+| Code | Meaning                               | Typical action                    |
+| ---- | ------------------------------------- | --------------------------------- |
+| `0`  | **OK** (no disallowed findings)       | Proceed                           |
+| `1`  | Usage/runtime error                   | Fix invocation/environment        |
+| `2`  | **REVIEW** (human review recommended) | Pause; triage/redact/approve      |
+| `3`  | **BLOCK** (prohibited indicators)     | Stop; escalate or remove findings |
+
+Wire these into pre-commit hooks, upload wrappers, or CI to prevent accidental leaks.
+
+---
+
+## Report header (prepended to every output)
+
+```
+AI Upload Guard — Advisory Only
+Heuristic findings for human triage. False negatives/positives are possible.
+Not a substitute for DLP, security review, or legal/compliance approvals.
+Dispositions: BLOCK | REDACT | REVIEW | PROCEED (record your decision).
+Rulepack vX.Y.Z (SHA256: …)
+```
+
+---
+
+## First-run risk acknowledgment (recommended UX)
+
+On first run (or always, if you prefer), display:
+
+```
+AI Upload Guard — Risk Acknowledgment
+This tool is a LOCAL heuristic prescan only. It will miss things and may misclassify content.
+It is NOT DLP, NOT a security control, and NOT legal/compliance review.
+You remain responsible for any data you upload.
+
+Type "I UNDERSTAND" to continue, or run with --acknowledge-risks to suppress.
+```
+
+Persist an acknowledgment file or require `--acknowledge-risks` in CI/wrappers.
+
 ---
 
 ## Installation
 
 ### Windows
 
-1. **Install Python 3 (64-bit):**
-   Download from [https://www.python.org/downloads/windows/](https://www.python.org/downloads/windows/) and check **“Add Python to PATH”**.
-
+1. **Install Python 3 (64-bit):** download from python.org and check **“Add Python to PATH.”**
 2. **(Optional) Create a virtual env** in the project folder:
 
-```cmd
-python -m venv .venv
-.\.venv\Scripts\activate
-```
-
+   ```cmd
+   python -m venv .venv
+   .\.venv\Scripts\activate
+   ```
 3. **Install dependencies:**
 
-```cmd
-pip install pdfminer.six python-docx pandas openpyxl
-```
+   ```cmd
+   pip install pdfminer.six python-docx pandas openpyxl
+   ```
 
 ### Linux (Debian/Ubuntu example)
 
 1. **Install Python & pip (if needed):**
 
-```bash
-sudo apt update
-sudo apt install -y python3 python3-pip python3-venv
-```
-
+   ```bash
+   sudo apt update
+   sudo apt install -y python3 python3-pip python3-venv
+   ```
 2. **(Optional) Virtual env:**
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
 3. **Install dependencies:**
 
-```bash
-pip install pdfminer.six python-docx pandas openpyxl
-```
+   ```bash
+   pip install pdfminer.six python-docx pandas openpyxl
+   ```
 
 ### macOS
 
-1. **Install Python 3:**
-
-   * Easiest via **Homebrew**: `brew install python`
-   * Or download from [https://www.python.org/downloads/macos/](https://www.python.org/downloads/macos/)
-
+1. **Install Python 3:** Homebrew `brew install python` or python.org installer.
 2. **(Optional) Virtual env:**
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
 3. **Install dependencies:**
 
-```bash
-pip install pdfminer.six python-docx pandas openpyxl
-```
+   ```bash
+   pip install pdfminer.six python-docx pandas openpyxl
+   ```
 
 ---
 
@@ -220,7 +268,8 @@ python3 ai_upload_guard.py "/path/file.xlsx" --phone-context
 **Other**
 
 * `--assume-approved-tool` — clean files show as **ALLOWED\_WITH\_CONDITIONS**
-* `--strict` — treat **RESTRICTED** signals as **PROHIBITED**
+* `--strict` — treat **RESTRICTED** as **PROHIBITED**
+* `--acknowledge-risks` — skip interactive banner once acknowledged
 
 ---
 
@@ -257,9 +306,7 @@ python3 ai_upload_guard.py "/path/file.xlsx" --ignore-file "/path/ignore.txt"
 
 ## Optional one-click launchers
 
-### Windows (Batch)
-
-Create `run_check.bat` next to the script:
+### Windows (Batch) — `run_check.bat`
 
 ```bat
 @echo off
@@ -269,13 +316,11 @@ if "%~1"=="" (
   pause
   exit /b 1
 )
-python "%~dp0ai_upload_guard.py" "%~1" --context client --assume-approved-tool --max-unique 120 --no-bank-hints --phone-context
+python "%~dp0ai_upload_guard.py" "%~1" --context client --assume-approved-tool --max-unique 120 --no-bank-hints --phone-context --acknowledge-risks
 endlocal
 ```
 
-### Linux/macOS (Shell)
-
-Create `run_check.sh`:
+### Linux/macOS (Shell) — `run_check.sh`
 
 ```bash
 #!/usr/bin/env bash
@@ -284,7 +329,7 @@ if [ $# -lt 1 ]; then
   echo 'Usage: ./run_check.sh "/path/to/file.ext"'
   exit 1
 fi
-python3 "$(dirname "$0")/ai_upload_guard.py" "$1" --context client --assume-approved-tool --max-unique 120 --no-bank-hints --phone-context
+python3 "$(dirname "$0")/ai_upload_guard.py" "$1" --context client --assume-approved-tool --max-unique 120 --no-bank-hints --phone-context --acknowledge-risks
 ```
 
 Make it executable:
@@ -310,3 +355,38 @@ chmod +x run_check.sh
   `--ip-as-prohibited --hostnames-as-prohibited --unknown-as-prohibited --phone-context --no-bank-hints`
 * Maintain a shared `ignore.txt` for benign recurring tokens (VM labels, subnet masks, test IPs).
 * Periodically rotate/tighten the **secrets** patterns (add your org’s token formats).
+* Fail closed in CI by treating exit codes ≥2 as upload blockers.
+
+---
+
+## Compliance & legal notice
+
+This software provides advisory, local-only heuristic scans to assist users in identifying potentially sensitive content prior to upload. It **does not** constitute a compliance control or legal review and **does not** itself satisfy obligations under HIPAA, PCI DSS, GLBA, FERPA, GDPR, CCPA, SOX, or any other framework. **No warranty** is provided; use at your own risk.
+
+---
+
+## Security contact
+
+Report vulnerabilities or concerns to: **[security@example.com](mailto:security@example.com)** (replace with your address).
+
+---
+
+## Versioning & provenance
+
+* Print **rulepack version** and **SHA-256** in every report.
+* Tag releases (`vX.Y.Z`) and include a **CHANGELOG.md**.
+* Add SPDX headers in source (e.g., `# SPDX-License-Identifier: 0BSD`).
+
+---
+
+## License
+
+Choose a permissive license and include it as `LICENSE` at repo root.
+
+* **0BSD** or **The Unlicense**: *no attribution required*.
+* **MIT** / **BSD-2-Clause**: very permissive, attribution required.
+
+---
+
+> ✅ **Reminder:** A license covers *reuse of your code*. The warnings above cover *safe use of the tool*. Keep both.
+
